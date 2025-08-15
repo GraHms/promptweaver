@@ -3,410 +3,541 @@ package promptweaver
 import (
 	"bufio"
 	"bytes"
-	"encoding/xml"
-	"fmt"
+	"errors"
 	"io"
-	"regexp"
 	"strings"
 )
 
-func NewEngine(reg *Registry, opts ...func(*Engine)) *Engine {
-	e := &Engine{reg: reg, policy: UnknownDrop}
-	for _, o := range opts {
-		o(e)
-	}
-	return e
-}
-func WithUnknownPolicy(p UnknownTagPolicy) func(*Engine) {
-	return func(e *Engine) { e.policy = p }
+// SectionPlugin declares a tag name that the engine should recognize and emit.
+type SectionPlugin struct {
+	Name    string
+	Aliases []string
 }
 
-type Event interface{ isEvent() }
-
-type CreateFileEvent struct {
-	Path string
-}
-
-// WriteFileEvent represents an atomic "create/overwrite and write" operation.
-// If Create is true, the executor should ensure the file is created (or truncated) before writing.
-type WriteFileEvent struct {
-	Path     string
-	Language string // optional; useful when body came from a code fence
-	Content  string
-	Create   bool // true when emitted from <CreateFile> with content
-}
-
-func (WriteFileEvent) isEvent() {}
-
-func (CreateFileEvent) isEvent() {}
-
-type EditFileEvent struct {
-	Path string
-}
-
-func (EditFileEvent) isEvent() {}
-
+// SectionEvent is emitted when a registered section is closed (or a self-closing tag is parsed).
 type SectionEvent struct {
-	Name     string // e.g., Thinking, Analysis, Planning
-	Content  string
-	Metadata map[string]string
+	Name    string            // section/tag name
+	Attrs   map[string]string // parsed attributes on the opening tag
+	Content string            // inner text content between <tag> and </tag>
 }
 
-func (SectionEvent) isEvent() {}
+// Registry holds enabled section names. It maps aliases -> canonical name.
+type Registry struct{ canon map[string]string }
 
-type CodeBlockEvent struct {
-	Name     string
-	Language string // e.g., tsx, go, bash
-	File     string // optional; from file="..."
-	Content  string
+func NewRegistry() *Registry { return &Registry{canon: map[string]string{}} }
+func (r *Registry) Register(p SectionPlugin) {
+	if p.Name == "" {
+		return
+	}
+	canon := strings.ToLower(p.Name)
+	r.canon[canon] = canon
+	for _, a := range p.Aliases {
+		if a == "" {
+			continue
+		}
+		r.canon[strings.ToLower(a)] = canon
+	}
+}
+func (r *Registry) IsAllowed(name string) bool { _, ok := r.canon[strings.ToLower(name)]; return ok }
+func (r *Registry) Canonical(name string) (string, bool) {
+	c, ok := r.canon[strings.ToLower(name)]
+	return c, ok
 }
 
-func (CodeBlockEvent) isEvent() {}
+// HandlerSink routes events to handlers registered per section name.
+type HandlerSink struct{ handlers map[string]func(SectionEvent) }
 
-// ===== Sink =====
-
-type EventSink interface {
-	OnEvent(ev Event)
+func NewHandlerSink() *HandlerSink { return &HandlerSink{handlers: map[string]func(SectionEvent){}} }
+func (s *HandlerSink) RegisterHandler(section string, fn func(SectionEvent)) {
+	if section == "" || fn == nil {
+		return
+	}
+	s.handlers[strings.ToLower(section)] = fn
 }
-
-type EventSinkFunc func(ev Event)
-
-func (f EventSinkFunc) OnEvent(ev Event) { f(ev) }
-
-// ===== Plugins =====
-
-type Plugin interface {
-	// Names returns XML tag names handled by this plugin (e.g., ["CreateFile"]).
-	Names() []string
-	// HandleXMLElement is called with the full XML start.end or self-closed element string.
-	HandleXMLElement(raw string, dec *xml.Decoder, start xml.StartElement, sink EventSink) error
-}
-
-type Registry struct {
-	byName map[string]Plugin
-}
-
-func NewRegistry() *Registry {
-	return &Registry{byName: map[string]Plugin{}}
-}
-
-func (r *Registry) Register(p Plugin) {
-	for _, n := range p.Names() {
-		r.byName[strings.ToLower(n)] = p
+func (s *HandlerSink) Emit(ev SectionEvent) {
+	if fn, ok := s.handlers[strings.ToLower(ev.Name)]; ok {
+		fn(ev)
 	}
 }
 
-func (r *Registry) get(name string) (Plugin, bool) {
-	p, ok := r.byName[strings.ToLower(name)]
-	return p, ok
-}
+// Engine coordinates streaming parsing and event emission.
+type Engine struct{ reg *Registry }
 
-// ===== Engine =====
+func NewEngine(reg *Registry) *Engine { return &Engine{reg: reg} }
 
-var (
-
-	// Start de uma tag XML com nome [A-Za-z][\w.-]* e atributos até ao '>'.
-	xmlStartRe = regexp.MustCompile(`(?s)<([A-Za-z][\w\.\-:]*)\b[^>]*>`)
-	// Tag self-close: <Tag .../>
-	xmlSelfCloseRe = regexp.MustCompile(`(?s)^<([A-Za-z][\w\.\-:]*)\b[^>]*/\s*>$`)
-)
-
-// ProcessStream reads from r in chunks and incrementally emits Events.
-// It keeps extracting as long as the buffer contains a complete unit.
-// At EOF, it *drains* the buffer by repeatedly calling tryExtract until no progress.
-func (e *Engine) ProcessStream(r io.Reader, sink EventSink) error {
+// ProcessStream incrementally parses from r and emits SectionEvents to sink as soon as sections close.
+// The format is a resilient XML-lite with rules:
+//   - Opening tag:   <name attr="value" attr2='v'>
+//   - Closing tag:   </name>
+//   - Self-closing:  <name .../>
+//   - Text nodes are treated as raw content. Nesting is supported; only registered tags produce events.
+func (e *Engine) ProcessStream(r io.Reader, sink *HandlerSink) error {
+	if e.reg == nil {
+		return errors.New("nil registry")
+	}
 	br := bufio.NewReader(r)
-	var buf bytes.Buffer
 
+	p := newParser(e.reg, sink)
+	buf := make([]byte, 4096)
 	for {
-		chunk := make([]byte, 4096)
-		n, err := br.Read(chunk)
+		n, readErr := br.Read(buf)
 		if n > 0 {
-			buf.Write(chunk[:n])
-			// Extract as much as we can from the current buffer.
-			for {
-				progress, perr := e.tryExtract(&buf, sink)
-				if perr != nil {
-					return perr
-				}
-				if !progress {
-					break
-				}
+			p.feed(buf[:n])
+			if err := p.drain(); err != nil {
+				return err
 			}
 		}
-		if err == io.EOF {
-			// IMPORTANT: fully drain whatever remains after the last read.
-			for {
-				progress, _ := e.tryExtract(&buf, sink)
-				if !progress {
-					break
-				}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return p.finish()
 			}
+			return readErr
+		}
+	}
+}
+
+// --- Streaming parser implementation ---
+
+// --- Streaming parser implementation (flat / non-nested) ---
+
+type parser struct {
+	reg    *Registry
+	sink   *HandlerSink
+	buf    bytes.Buffer // rolling buffer of unconsumed bytes
+	active *element     // currently open recognized section, or nil
+}
+
+type element struct {
+	name  string // original open tag name as seen in stream (e.g., "create-file")
+	canon string // canonical name if recognized (e.g., "write-file"); empty if unknown
+	attrs map[string]string
+	body  strings.Builder
+}
+
+func newParser(reg *Registry, sink *HandlerSink) *parser { return &parser{reg: reg, sink: sink} }
+
+func (p *parser) feed(b []byte) { p.buf.Write(b) }
+
+// drain consumes as much of p.buf as possible.
+// Flat mode: if a recognized tag is open, treat all inner bytes as text until its matching </...>.
+func (p *parser) drain() error {
+	for {
+		data := p.buf.Bytes()
+		if len(data) == 0 {
 			return nil
 		}
-		if err != nil {
-			return err
-		}
-	}
-}
 
-// 4. Balanced XML: <Tag> ... </Tag>
-func (e *Engine) tryExtract(buf *bytes.Buffer, sink EventSink) (bool, error) {
-	b := buf.Bytes()
-	if len(b) == 0 {
-		return false, nil
-	}
+		// If we are inside a recognized section, stream raw until its close.
+		if p.active != nil {
+			// Write everything up to the next '<' (if any)
+			lt := bytes.IndexByte(data, '<')
+			if lt == -1 {
+				// No '<' at all → dump everything as content
+				p.active.body.Write(data)
+				p.consume(len(data))
+				continue
+			}
+			if lt > 0 {
+				// Write text before '<'
+				p.active.body.Write(data[:lt])
+				p.consume(lt)
+				continue
+			}
 
-	// 0) Skip ONLY leading ASCII whitespace
-	trim := 0
-	for trim < len(b) {
-		switch b[trim] {
-		case ' ', '\t', '\r', '\n':
-			trim++
-		default:
-			goto afterTrim
-		}
-	}
-afterTrim:
-	if trim > 0 {
-		buf.Next(trim)
-		return true, nil
-	}
-	b = buf.Bytes()
-	if len(b) == 0 {
-		return false, nil
-	}
-
-	// 1) Backtick code fence: ```<lang> <meta>\n ... ```
-	if bytes.HasPrefix(b, []byte("```")) {
-		nl := bytes.IndexByte(b, '\n')
-		if nl == -1 {
-			return false, nil // header incomplete
-		}
-		header := strings.TrimSpace(string(b[3:nl]))
-		var lang, meta string
-		if sp := strings.IndexByte(header, ' '); sp >= 0 {
-			lang = header[:sp]
-			meta = strings.TrimSpace(header[sp+1:])
-		} else {
-			lang = header
-		}
-
-		rest := b[nl+1:]
-		closeAt := -1
-		scan := rest
-		offset := 0
-		for {
-			eol := bytes.IndexByte(scan, '\n')
-			if eol == -1 {
-				if bytes.HasPrefix(bytes.TrimLeft(scan, " \t"), []byte("```")) {
-					closeAt = offset
-					break
+			// Now data[0] == '<' — it *might* be our closing tag.
+			// Only close if it’s exactly a recognized close for this active section (by alias/canonical).
+			consumed, isClose, complete := p.parseOwnClose(data)
+			if !complete {
+				// Need more bytes to decide
+				return nil
+			}
+			if isClose {
+				// Consume the closing tag and emit the section event
+				p.consume(consumed)
+				ev := SectionEvent{
+					Name:    p.active.canon,
+					Attrs:   p.active.attrs,
+					Content: p.active.body.String(),
 				}
-				return false, nil
+				p.active = nil
+				p.sink.Emit(ev)
+				continue
 			}
-			line := scan[:eol]
-			if bytes.HasPrefix(bytes.TrimLeft(line, " \t"), []byte("```")) {
-				closeAt = offset
-				break
-			}
-			offset += eol + 1
-			scan = scan[eol+1:]
-		}
 
-		body := string(rest[:closeAt])
-		consumed := (nl + 1) + closeAt
-		closingRemainder := rest[closeAt:]
-		if eol := bytes.IndexByte(closingRemainder, '\n'); eol >= 0 {
-			consumed += eol + 1
-		} else {
-			consumed = len(b)
-		}
-
-		file := parseKeyValue(meta, "file")
-		buf.Next(consumed)
-		sink.OnEvent(CodeBlockEvent{Language: lang, File: file, Content: body})
-		return true, nil
-	}
-
-	// 2) Self-closed XML at buffer start: <Tag ... />
-	if loc := nextTagEnd(b); loc > 0 {
-		first := string(b[:loc])
-		if xmlSelfCloseRe.MatchString(first) {
-			buf.Next(loc)
-			dec := xml.NewDecoder(strings.NewReader(first))
-			tok, derr := dec.Token()
-			if derr != nil {
-				return true, derr
+			// Not our closing tag → treat leading '<' as literal text
+			// (Optional: if the next chars are "</", consume both; otherwise just consume '<')
+			if len(data) >= 2 && data[1] == '/' {
+				p.active.body.WriteString("</")
+				p.consume(2)
+			} else {
+				p.active.body.WriteByte('<')
+				p.consume(1)
 			}
-			se, ok := tok.(xml.StartElement)
-			if !ok {
-				return true, fmt.Errorf("expected StartElement for self-closed tag")
-			}
-			if p, ok := e.reg.get(se.Name.Local); ok {
-				if err := p.HandleXMLElement(first, dec, se, sink); err != nil {
-					return true, err
-				}
-				return true, nil
-			}
-			return true, nil // unknown tag: ignore
-		}
-	}
-
-	// 3) Balanced XML block: <Tag> ... </Tag>
-	if start := xmlStartRe.FindIndex(b); start != nil && start[0] == 0 {
-		name := string(xmlStartRe.FindSubmatch(b)[1])
-		endIdx, full := findBalancedXMLElement(b, name)
-		if full {
-			raw := b[:endIdx]
-			buf.Next(endIdx)
-			dec := xml.NewDecoder(bytes.NewReader(raw))
-			tok, derr := dec.Token()
-			if derr != nil {
-				return true, derr
-			}
-			se, ok := tok.(xml.StartElement)
-			if !ok {
-				return true, fmt.Errorf("expected StartElement")
-			}
-			if p, ok := e.reg.get(se.Name.Local); ok {
-				if err := p.HandleXMLElement(string(raw), dec, se, sink); err != nil {
-					return true, err
-				}
-				return true, nil
-			}
-			// unknown tag: still emit as SectionEvent if auditing
-			if e.policy == UnknownAudit {
-				body, _ := readInnerText(dec, se)
-				sink.OnEvent(SectionEvent{Name: se.Name.Local, Content: strings.TrimSpace(body)})
-			}
-			return true, nil
-		}
-	}
-
-	// 4) Plain text: emit until next tag/fence or EOF
-	nextPos := len(b)
-	if loc := bytes.Index(b, []byte("```")); loc >= 0 && loc < nextPos {
-		nextPos = loc
-	}
-	if loc := xmlStartRe.FindIndex(b); loc != nil && loc[0] < nextPos {
-		nextPos = loc[0]
-	}
-
-	nextTag := bytes.IndexByte(b, '<')
-	nextFence := bytes.Index(b, []byte("```"))
-	nextPos = minPositive(nextTag, nextFence, len(b))
-
-	if nextPos > 0 {
-		plain := string(b[:nextPos])
-		buf.Next(nextPos)
-		sink.OnEvent(SectionEvent{Name: "PlainText", Content: strings.TrimSpace(plain)})
-		return true, nil
-	}
-
-	return false, nil
-}
-func minPositive(vals ...int) int {
-	min := -1
-	for _, v := range vals {
-		if v < 0 {
 			continue
 		}
-		if min == -1 || v < min {
-			min = v
+
+		// No active section: look for a tag opener
+		lt := bytes.IndexByte(data, '<')
+		if lt == -1 {
+			// Text outside any tag is ignored
+			p.buf.Reset()
+			return nil
+		}
+		if lt > 0 {
+			// Ignore preceding text
+			p.consume(lt)
+			continue
+		}
+
+		// data[0] == '<' — try to parse a tag token
+		consumed, tok, ok := parseTagToken(data)
+		if !ok {
+			// Need more bytes to complete tag
+			return nil
+		}
+		p.consume(consumed)
+
+		switch tok.kind {
+		case tokenOpen:
+			if c, ok := p.reg.Canonical(tok.name); ok {
+				// Start flat (raw) mode for this section
+				p.active = &element{name: tok.name, canon: c, attrs: tok.attrs}
+			} else {
+				// Unknown tag outside sections → ignore it (and its contents are ignored too,
+				// because we never enter active mode for unknowns)
+			}
+
+		case tokenSelfClose:
+			if c, ok := p.reg.Canonical(tok.name); ok {
+				p.sink.Emit(SectionEvent{Name: c, Attrs: tok.attrs, Content: ""})
+			} // else ignore
+
+		case tokenClose:
+			// Closing tag with no active section → ignore
 		}
 	}
-	if min == -1 {
-		return 0 // ou len(buf), dependendo do contexto
-	}
-	return min
 }
 
-// ===== util =====
+// parseOwnClose checks whether data starts with a closing tag that should close p.active.
+// Accepts any alias whose canonical equals p.active.canon.
+// Returns (consumedBytes, isOurClose, complete).
 
-func parseKeyValue(meta, key string) string {
-	// meta: e.g. file="components/button.tsx" other=...
-	keyEq := key + "="
-	idx := strings.Index(meta, keyEq)
-	if idx < 0 {
+func (p *parser) parseOwnClose(data []byte) (int, bool, bool) {
+	if p.active == nil {
+		return 0, false, true
+	}
+	if len(data) < 2 || data[0] != '<' || data[1] != '/' {
+		return 0, false, true
+	}
+	i := 2
+	// NEW: tolerate whitespace after "</"
+	for i < len(data) && isSpace(data[i]) {
+		i++
+	}
+	if i == len(data) {
+		return 0, false, false
+	}
+
+	start := i
+	for i < len(data) && isNameChar(data[i]) {
+		i++
+	}
+	if i == start { // no name
+		return 0, false, true
+	}
+	if i == len(data) { // incomplete closer across chunk
+		return 0, false, false
+	}
+
+	closeName := strings.ToLower(string(data[start:i]))
+
+	// Accept if canonical(closeName) == active.canon
+	if c, ok := p.reg.Canonical(closeName); ok {
+		if c != p.active.canon {
+			return 0, false, true
+		}
+	} else {
+		// Fallback: literal match against the original open tag name (case-insensitive)
+		if !strings.EqualFold(closeName, p.active.name) {
+			return 0, false, true
+		}
+	}
+
+	// optional spaces before '>'
+	for i < len(data) && isSpace(data[i]) {
+		i++
+	}
+	if i == len(data) {
+		return 0, false, false
+	}
+	if data[i] != '>' {
+		return 0, false, true
+	}
+
+	return i + 1, true, true
+}
+
+func (p *parser) finish() error {
+	// If buffer has leftover bytes, and we are inside a section, they are part of the content.
+	if p.buf.Len() > 0 && p.active != nil {
+		p.active.body.Write(p.buf.Bytes())
+		p.buf.Reset()
+	} else {
+		p.buf.Reset()
+	}
+	// Auto-close active recognized section on EOF
+	if p.active != nil && p.active.canon != "" {
+		p.sink.Emit(SectionEvent{
+			Name:    p.active.canon,
+			Attrs:   p.active.attrs,
+			Content: p.active.body.String(),
+		})
+		p.active = nil
+	}
+	return nil
+}
+
+func (p *parser) appendText(s string) {
+	// In flat mode, we only append when an active section exists.
+	if p.active == nil || s == "" {
+		return
+	}
+	p.active.body.WriteString(s)
+}
+
+func (p *parser) consume(n int) { _ = p.buf.Next(n) }
+
+// --- Tag tokenization ---
+
+type tagTokenKind int
+
+const (
+	tokenOpen tagTokenKind = iota
+	tokenClose
+	tokenSelfClose
+)
+
+type tagToken struct {
+	kind  tagTokenKind
+	name  string
+	attrs map[string]string
+}
+
+// parseTagToken tries to parse a single tag token from the beginning of data (which must start with '<').
+// Returns (consumedBytes, token, ok). If ok=false, the caller should wait for more input.
+func parseTagToken(data []byte) (int, tagToken, bool) {
+	if len(data) == 0 || data[0] != '<' {
+		return 0, tagToken{}, false
+	}
+
+	i := 1
+	skipSpaces := func() {
+		for i < len(data) && isSpace(data[i]) {
+			i++
+		}
+	}
+
+	// Closing tag?
+	if i < len(data) && data[i] == '/' {
+		i++
+		start := i
+		for i < len(data) && isNameChar(data[i]) {
+			i++
+		}
+		if i == len(data) {
+			return 0, tagToken{}, false
+		}
+		name := string(data[start:i])
+		skipSpaces()
+		if i == len(data) || data[i] != '>' {
+			return 0, tagToken{}, false
+		}
+		return i + 1, tagToken{kind: tokenClose, name: name}, true
+	}
+
+	// Opening or self-closing
+	start := i
+	for i < len(data) && isNameChar(data[i]) {
+		i++
+	}
+	if i == len(data) {
+		return 0, tagToken{}, false
+	}
+	name := string(data[start:i])
+
+	attrs := map[string]string{}
+	for {
+		skipSpaces()
+		if i == len(data) {
+			return 0, tagToken{}, false
+		}
+
+		switch data[i] {
+		case '>':
+			return i + 1, tagToken{kind: tokenOpen, name: name, attrs: attrs}, true
+		case '/':
+			i++
+			if i == len(data) || data[i] != '>' {
+				return 0, tagToken{}, false
+			}
+			return i + 1, tagToken{kind: tokenSelfClose, name: name, attrs: attrs}, true
+		}
+
+		// attribute key
+		kStart := i
+		for i < len(data) && isAttrNameChar(data[i]) {
+			i++
+		}
+		if i == len(data) {
+			return 0, tagToken{}, false
+		}
+		key := string(data[kStart:i])
+
+		skipSpaces()
+		if i == len(data) || data[i] != '=' {
+			return 0, tagToken{}, false
+		}
+		i++
+		skipSpaces()
+		if i == len(data) {
+			return 0, tagToken{}, false
+		}
+
+		// attribute value: quoted "…"/'…' OR JSX braced { … }
+		switch data[i] {
+		case '"', '\'':
+			quote := data[i]
+			i++
+			vStart := i
+			for i < len(data) && data[i] != quote {
+				if data[i] == '\\' && i+1 < len(data) { // skip escapes
+					i += 2
+					continue
+				}
+				i++
+			}
+			if i == len(data) {
+				return 0, tagToken{}, false
+			}
+			val := string(data[vStart:i])
+			i++ // consume closing quote
+			attrs[strings.ToLower(strings.TrimSpace(key))] = val
+
+		case '{':
+			// scan balanced braces, allowing nested { } and quoted strings inside
+			i++
+			vStart := i
+			depth := 1
+			for i < len(data) && depth > 0 {
+				switch data[i] {
+				case '{':
+					depth++
+					i++
+				case '}':
+					depth--
+					i++
+				case '"', '\'':
+					q := data[i]
+					i++
+					for i < len(data) && data[i] != q {
+						if data[i] == '\\' && i+1 < len(data) {
+							i += 2
+							continue
+						}
+						i++
+					}
+					if i == len(data) {
+						return 0, tagToken{}, false
+					}
+					i++ // consume closing quote
+				default:
+					i++
+				}
+			}
+			if depth != 0 {
+				return 0, tagToken{}, false
+			} // incomplete
+			val := string(data[vStart : i-1]) // without outer braces
+			attrs[strings.ToLower(strings.TrimSpace(key))] = "{" + val + "}"
+
+		default:
+			// unsupported value form (bareword) → treat as incomplete to wait for more bytes
+			return 0, tagToken{}, false
+		}
+	}
+}
+
+func isSpace(b byte) bool { return b == ' ' || b == '\n' || b == '\t' || b == '\r' }
+func isNameChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '-'
+}
+func isAttrNameChar(b byte) bool { return isNameChar(b) }
+
+func matchIndex(stack []*element, closeName string, reg *Registry) int {
+	// Prefer canonical/alias match if recognized
+	if c, ok := reg.Canonical(closeName); ok {
+		for i := len(stack) - 1; i >= 0; i-- {
+			if stack[i].canon == c {
+				return i
+			}
+		}
+		return -1
+	}
+	// Fallback: match by original name (for unknown inner markup like </div>)
+	for i := len(stack) - 1; i >= 0; i-- {
+		if strings.EqualFold(stack[i].name, closeName) {
+			return i
+		}
+	}
+	return -1
+}
+
+func attrsToString(m map[string]string) string {
+	if len(m) == 0 {
 		return ""
 	}
-	val := strings.TrimSpace(meta[idx+len(keyEq):])
-	if strings.HasPrefix(val, `"`) {
-		val = strings.TrimPrefix(val, `"`)
-		if q := strings.Index(val, `"`); q >= 0 {
-			return val[:q]
+	var b strings.Builder
+	first := true
+	for k, v := range m {
+		if !first {
+			b.WriteByte(' ')
+		} else {
+			first = false
 		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteByte('"')
+		b.WriteString(strings.ReplaceAll(v, "\"", "&quot;"))
+		b.WriteByte('"')
 	}
-	return strings.Fields(val)[0]
+	return b.String()
 }
 
-// findBalancedXMLElement encontra o índice logo após o fechamento </name> correspondente.
-func findBalancedXMLElement(b []byte, name string) (end int, ok bool) {
-	openTag := "<" + name
-	closeTag := "</" + name
-	count := 0
-	i := 0
-	for i < len(b) {
-		o := bytes.Index(b[i:], []byte(openTag))
-		c := bytes.Index(b[i:], []byte(closeTag))
-		if o == -1 && c == -1 {
-			return 0, false
-		}
-		if o != -1 && (c == -1 || o < c) {
-			// avançar até '>' desta abertura
-			j := i + o
-			k := bytes.IndexByte(b[j:], '>')
-			if k == -1 {
-				return 0, false
-			}
-			count++
-			i = j + k + 1
-			continue
-		}
-		if c != -1 {
-			// avançar até '>' deste fechamento
-			j := i + c
-			k := bytes.IndexByte(b[j:], '>')
-			if k == -1 {
-				return 0, false
-			}
-			count--
-			i = j + k + 1
-			if count == 0 {
-				return i, true
-			}
-			continue
-		}
+func looksLikeOwnClose(data []byte, openName string) (bool, bool) {
+	// returns (isCloseForThis, complete)
+	if len(data) < 3 || data[0] != '<' || data[1] != '/' {
+		// not even a closing tag
+		return false, true
 	}
-	return 0, false
+	// Need enough bytes to compare the name
+	if len(data) < 2+len(openName)+1 { // + '>' at least
+		return false, false // incomplete
+	}
+	// Compare name literally after "</"
+	if !strings.HasPrefix(string(data[2:]), openName) {
+		return false, true
+	}
+	j := 2 + len(openName)
+	// allow spaces before '>'
+	for j < len(data) && isSpace(data[j]) {
+		j++
+	}
+	if j < len(data) && data[j] == '>' {
+		return true, true
+	}
+	// maybe incomplete (e.g., boundary right before '>')
+	return false, false
 }
 
-func nextTagEnd(b []byte) int {
-	if len(b) == 0 || b[0] != '<' {
-		return 0
-	}
-	i := bytes.IndexByte(b, '>')
-	if i < 0 {
-		return 0
-	}
-	return i + 1
-}
-
-func readInnerText(dec *xml.Decoder, start xml.StartElement) (string, error) {
-	var sb strings.Builder
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return sb.String(), err
-		}
-		switch t := tok.(type) {
-		case xml.CharData:
-			sb.Write(t)
-		case xml.EndElement:
-			if t.Name.Local == start.Name.Local {
-				return sb.String(), nil
-			}
-		}
-	}
-}
+// ReaderFromString is a helper to turn strings into an io.Reader for tests/examples.
+func ReaderFromString(s string) io.Reader { return strings.NewReader(s) }

@@ -1,293 +1,327 @@
+# Promptweaver
 
-# promptweaver
+**Promptweaver** is a streaming, XML-lite **event parser** for model output.
+You give it an `io.Reader`. You register a handful of tags.
+It emits **events** the moment a tag closes.
 
-`promptweaver` is a Go library for **parsing, structuring, and streaming hybrid text** — a mix of **plain text**, **XML-like tags**, and **metadata** — in a **progressive, event-driven way**.
-
-It’s perfect for:
-
-* Parsing **LLM outputs** or agent instructions.
-* Handling **mixed content**: structured tags and free text.
-* Incremental processing of **streamed text**, without waiting for the full input.
-* Extracting meaningful events from text for automated workflows or analytics.
+No DOM. No schema. No nesting rules to memorize.
+Just a clean, predictable way to turn text into actions.
 
 ---
 
-### Installation
+## Explainer
+
+Large models often speak in paragraphs but **act** in sections:
+
+```xml
+<think>Outline a plan…</think>
+<create-file path="app/page.tsx">…code…</create-file>
+<summary>What changed and why.</summary>
+```
+
+You don’t want to wait for the whole response. You want to **react as soon as a section is done**:
+
+* print the plan,
+* write the file,
+* then show the summary.
+
+Promptweaver reads the stream as it arrives and emits an event on each **closing tag**. Everything between `<open …>` and its matching `</close>` is delivered verbatim (for recognized tags). That keeps code intact—JSX, angle brackets, braces—without tripping a structured parser.
+
+---
+
+## What it does
+
+* Reads bytes incrementally from an `io.Reader`.
+* Recognizes **section tags** you register (with **aliases**).
+* For each recognized tag:
+
+    * Captures **all content** between `<tag …>` and the **first** matching `</tag>`.
+    * Emits a `SectionEvent` with `Name`, `Attrs`, and `Content`.
+
+That’s the contract.
+
+---
+
+## What it does **not** do
+
+* It does **not** parse nested sections inside a recognized section.
+  Once a section opens, **everything** until its closer is treated as plain text.
+* It does **not** invent closes.
+  If a section never closes, it runs to **EOF**; then Promptweaver emits what it has.
+* It does **not** spawn goroutines or manage I/O for you.
+  Your handlers are called synchronously.
+
+---
+
+## Installation
 
 ```bash
 go get github.com/grahms/promptweaver
 ```
 
----
 
-## Why promptweaver
-
-Traditional XML parsers fail when:
-
-* Tags are **dynamic or unknown**, e.g., `<Thinking>` or `<CreateFile>`.
-* Text is **partial or streaming**, e.g., LLM output arriving in chunks.
-* Mixed content combines **plain text with tags**.
-
-`promptweaver` solves this by:
-
-* Emitting **SectionEvent** for any meaningful content.
-* **Incremental parsing**: handles incomplete tags safely.
-* Preserving **plain text context** outside tags.
-* Configurable **unknown tag handling** (`audit` or `drop`).
+Go 1.21+ recommended.
 
 ---
 
-## Core Concepts
-
-* **Engine**: Reads a stream of text and emits `SectionEvent`s.
-* **SectionEvent**: Represents any chunk of meaningful content (tag or plain text).
-  Fields: `Name string`, `Content string`, `Metadata map[string]string`
-* **EventSink**: Receives events from the engine.
-* **Plugin**: Custom handler for tags.
-* **UnknownTagPolicy**: Determines what happens to unknown tags.
-
----
-
-## Examples
-
-### 1. Parsing Instructions with SectionEvent
-
-```go
-reg := promptweaver.NewRegistry()
-reg.Register(promptweaver.SectionPlugin{name: "CreateFile"})
-reg.Register(promptweaver.SectionPlugin{name: "EditFile"})
-reg.Register(promptweaver.SectionPlugin{name: "Summary"})
-
-engine := promptweaver.NewEngine(reg)
-sink := &recorderSink{}
-
-input := `
-Hello team!
-<CreateFile path="main.go">package main</CreateFile>
-Keep building.
-<EditFile path="main.go">func RunAgent() {}</EditFile>
-<Summary>Agent created and edited</Summary>
-`
-
-engine.ProcessStream(strings.NewReader(input), sink)
-
-for _, ev := range sink.events {
-    fmt.Printf("[%s] %s\n", ev.Name, ev.Content)
-}
-```
-
-**Output:**
-
-```
-[PlainText] Hello team!
-[CreateFile] package main
-[PlainText] Keep building.
-[EditFile] func RunAgent() {}
-[Summary] Agent created and edited
-```
-
----
-
-### 2. Handling Plain Text
-
-Plain text outside tags is captured automatically:
-
-```xml
-Hello world!
-<CreateFile path="app.go">package main</CreateFile>
-More text here.
-```
-
-**Emitted Events:**
-
-```
-[PlainText] Hello world!
-[CreateFile] package main
-[PlainText] More text here.
-```
-
----
-
-### 3. Streaming & Partial Tags
-
-If a tag is split across chunks (streaming input):
-
-```go
-chunks := []string{
-    "Some text <Create",
-    "File path=\"x.go\">package",
-    " main</CreateFile> More text",
-}
-reader := strings.NewReader(strings.Join(chunks, ""))
-engine.ProcessStream(reader, sink)
-```
-
-**Output preserves order and completeness:**
-
-```
-[PlainText] Some text
-[CreateFile] package main
-[PlainText] More text
-```
-
----
-
-### 4. Unknown Tags with Audit
-
-```go
-engine := promptweaver.NewEngine(reg, promptweaver.WithUnknownPolicy(promptweaver.UnknownAudit))
-input := `<Note>This is a note</Note>`
-engine.ProcessStream(strings.NewReader(input), sink)
-```
-
-**Emitted SectionEvent:**
-
-```
-[Note] This is a note
-```
-
----
-
-### 5. Nested Tags
-
-```xml
-<Summary>
-  Important:
-  <EditFile path="x.go">func main() {}</EditFile>
-</Summary>
-```
-
-**Events:**
-
-```
-[Summary] Important:
-[EditFile] func main() {}
-```
-
----
-
-## Real-World Scenarios
-
-* **Vibe Coding**: Track file modifications and instructions in real-time.
-* **Agent Workflows**: Parse multi-step LLM instructions incrementally.
-* **CLI Capture**: Record commands and outputs with metadata.
-* **Streaming Logs**: Extract actionable events while preserving context.
-* **Progressive File Generation**: Generate files directly from instructions.
-
----
-
-This version keeps everything **uniform under `SectionEvent`**, which simplifies event handling and makes it easy to register plugins for any tag while still preserving plain text.
-
----
-
-Perfect — here’s a **full example project** using only `SectionEvent`, showing a realistic, streaming, multi-tag scenario like you’d see in a Vibe coding session or agent-driven instructions.
-
----
-
-# Full Example Project: “VibeFlow”
+## Quick Start
 
 ```go
 package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
-	"github.com/grahms/promptweaver"
+
+	"github.com/yourorg/promptweaver"
 )
 
-// recorderSink collects all SectionEvents emitted by the engine
-type recorderSink struct {
-	events []promptweaver.Event
-}
-
-func (r *recorderSink) OnEvent(ev promptweaver.Event) {
-	r.events = append(r.events, ev)
-}
-
 func main() {
-	// Step 1: Create a registry and register known tags
+	// 1) Declare the tags your model will use
 	reg := promptweaver.NewRegistry()
-	reg.Register(promptweaver.SectionPlugin{Name: "CreateFile"})
-	reg.Register(promptweaver.SectionPlugin{Name: "EditFile"})
-	reg.Register(promptweaver.SectionPlugin{Name: "Summary"})
-	reg.Register(promptweaver.SectionPlugin{Name: "Thinking"})
-	reg.Register(promptweaver.SectionPlugin{Name: "Analysis"})
+	reg.Register(promptweaver.SectionPlugin{Name: "think"})
+	reg.Register(promptweaver.SectionPlugin{
+		Name:    "write-file",
+		Aliases: []string{"create-file", "dyad-write"}, // any spelling the model might use
+	})
+	reg.Register(promptweaver.SectionPlugin{Name: "summary"})
 
-	// Step 2: Create the engine
-	engine := promptweaver.NewEngine(reg, promptweaver.WithUnknownPolicy(promptweaver.UnknownAudit))
-	sink := &recorderSink{}
+	// 2) Wire handlers for canonical names
+	sink := promptweaver.NewHandlerSink()
+	sink.RegisterHandler("think", func(ev promptweaver.SectionEvent) {
+		fmt.Println("[THINK]\n" + strings.TrimSpace(ev.Content))
+	})
 
-	// Step 3: Input text simulating streaming instructions from an LLM or agent
-	input := strings.TrimSpace(`
-Hello team!
-
-<Thinking>What files do we need?</Thinking>
-
-<CreateFile path="agent.go">
-package main
-
-func StartAgent() {}
-</CreateFile>
-
-More context for our workflow.
-
-<EditFile path="agent.go">
-func StartAgent() {
-    fmt.Println("Agent started")
-}
-</EditFile>
-
-<Summary>Agent file created and updated.</Summary>
-
-Final note: keep monitoring logs.
-`)
-
-	// Step 4: Process the text
-	engine.ProcessStream(strings.NewReader(input), sink)
-
-	// Step 5: Print all SectionEvents
-	for _, ev := range sink.events {
-		fmt.Printf("[%s] %s\n", ev.(promptweaver.SectionEvent).Name, strings.TrimSpace(ev.(promptweaver.SectionEvent).Content))
-		if len(ev.(promptweaver.SectionEvent).Metadata) > 0 {
-			fmt.Printf("  Metadata: %+v\n", ev.(promptweaver.SectionEvent).Metadata)
+	base := mustAbs("./workspace")
+	sink.RegisterHandler("write-file", func(ev promptweaver.SectionEvent) {
+		out := secureJoin(base, ev.Attrs["path"])
+		_ = os.MkdirAll(filepath.Dir(out), 0o755)
+		if err := os.WriteFile(out, []byte(ev.Content), 0o644); err != nil {
+			fmt.Println("write error:", err)
+			return
 		}
+		fmt.Printf("[CREATE FILE] %s ok\n", out)
+	})
+
+	sink.RegisterHandler("summary", func(ev promptweaver.SectionEvent) {
+		fmt.Println("[SUMMARY]\n" + strings.TrimSpace(ev.Content))
+	})
+
+	// 3) Stream
+	engine := promptweaver.NewEngine(reg)
+	src := promptweaver.ReaderFromString(
+		`<think>plan</think>` +
+			`<create-file path="main.ts">console.log("hi")</create-file>` +
+			`<summary>done</summary>`,
+	)
+
+	if err := engine.ProcessStream(src, sink); err != nil {
+		panic(err)
 	}
 }
 
-```
+func mustAbs(p string) string { a, _ := filepath.Abs(p); return a }
 
----
-
-## Expected Output
-
-```
-[PlainText] Hello team!
-[Thinking] What files do we need?
-[CreateFile] package main
-
-func StartAgent() {}
-  Metadata: map[path:agent.go]
-[PlainText] More context for our workflow.
-[EditFile] func StartAgent() {
-    fmt.Println("Agent started")
+// deny writes outside base
+func secureJoin(base, rel string) string {
+	base = filepath.Clean(base)
+	path := filepath.Clean(filepath.Join(base, rel))
+	if path != base && !strings.HasPrefix(path, base+string(os.PathSeparator)) {
+		panic("refusing to write outside base: " + rel)
+	}
+	return path
 }
-  Metadata: map[path:agent.go]
-[Summary] Agent file created and updated.
-[PlainText] Final note: keep monitoring logs.
 ```
 
 ---
 
-## Key Points in This Example
+## API
 
-1. **All content is captured via `SectionEvent`**, whether it’s plain text or structured tags.
-2. **Metadata is preserved** automatically for registered tags, e.g., `path="agent.go"`.
-3. **Streaming-safe**: Even if the text were read in chunks, the engine would still handle partial tags correctly.
-4. **Unknown tags**: Any unregistered tags would be audited (`UnknownAudit`) or dropped (`UnknownDrop`) depending on your policy.
-5. **Nested or multi-line content**: Works perfectly with tags containing multiple lines or internal indentation.
+```go
+type SectionPlugin struct {
+	Name    string   // canonical section name (what handlers see)
+	Aliases []string // alternative spellings your model might use
+}
+
+type SectionEvent struct {
+	Name    string            // canonical name
+	Attrs   map[string]string // attribute keys are lowercased
+	Content string            // everything between <open> and </close>
+}
+
+// Registry maps aliases -> canonical
+reg := promptweaver.NewRegistry()
+reg.Register(promptweaver.SectionPlugin{Name: "think"})
+reg.Register(promptweaver.SectionPlugin{Name: "write-file", Aliases: []string{"create-file"}})
+
+// Handlers route by canonical name
+sink := promptweaver.NewHandlerSink()
+sink.RegisterHandler("write-file", func(ev promptweaver.SectionEvent) { /* ... */ })
+
+engine := promptweaver.NewEngine(reg)
+_ = engine.ProcessStream(reader, sink)
+```
 
 ---
 
-This full example demonstrates how `promptweaver` can be used to **incrementally parse instructions, manage files, and capture plain text context** in a unified event-driven approach.
+## Streaming Semantics
+
+* **Emit on close**: an event fires as soon as `</tag>` is read. No need to buffer the whole response.
+* **Flat model**: inside a recognized section, Promptweaver **does not** parse inner tags; it treats them as content. This is why code survives intact.
+* **Unknown tags**:
+
+    * outside any recognized section: ignored.
+    * inside a recognized section: treated as literal text.
+* **EOF**: if the stream ends with a recognized section still open, that section is emitted with whatever content arrived.
 
 ---
+
+## Tag Grammar
+
+Promptweaver accepts a small, well-defined subset:
+
+* **Open**
+
+  ```
+  <name a="x" b='y' c={expr}>
+  ```
+
+    * `name`: letters, digits, `_`, `-`; case-insensitive.
+    * Attributes:
+
+        * keys are lowercased.
+        * values can be:
+
+            * `"double-quoted"`
+            * `'single-quoted'`
+            * `{ … }` (JSX-style). Braces are balanced; quotes inside are skipped.
+
+* **Close**
+
+  ```
+  </name>
+  </   name   >
+  ```
+
+    * Spaces after `</` and before `>` are allowed.
+    * Name matching is **case-insensitive**.
+
+* **Self-closing**
+
+  ```
+  <name …/>
+  ```
+
+    * If `name` is recognized, an event is emitted with empty content.
+
+* **Aliases**
+
+    * Open with `<create-file>` and close with `</dyad-write>` if both alias to the same canonical (e.g., `write-file`).
+    * If a closer name isn’t in the alias map, Promptweaver falls back to a **literal** match with the original open name.
+
+---
+
+## Practical Recipes
+
+### Multi-file code generation
+
+Model output:
+
+```xml
+<think>Outline</think>
+<create-file path="app/page.tsx">…</create-file>
+<create-file path="lib/api.ts">…</create-file>
+<summary>Notes and next steps.</summary>
+```
+
+Handlers:
+
+* `think` → print to console.
+* `write-file` → write to a sandboxed workspace; run a linter per file if you like.
+* `summary` → display as a final report.
+
+### Tool calls without JSON
+
+```xml
+<think>Plan</think>
+<run-bash cwd="." timeout="30s">npm test</run-bash>
+<summary>What failed and why.</summary>
+```
+
+Register `run-bash` and gate the handler with your policies. Since it is a recognized tag, the command body is captured exactly as written.
+
+### Incremental extraction
+
+```xml
+<record id="1">…</record>
+<record id="2">…</record>
+<record id="3">…</record>
+```
+
+Each record arrives as soon as it closes. You can ingest them one by one.
+
+---
+
+## Debugging
+
+* **See the exact text the model sent**
+
+  ```go
+  tee := io.TeeReader(reader, os.Stdout)
+  _ = engine.ProcessStream(tee, sink)
+  ```
+
+* **Test with small chunks**
+
+  ```go
+  type chunkedReader struct{ data []byte; pos, chunk int }
+  func (c *chunkedReader) Read(p []byte) (int, error) {
+  	if c.pos >= len(c.data) { return 0, io.EOF }
+  	n := c.chunk
+  	if n > len(c.data)-c.pos { n = len(c.data)-c.pos }
+  	copy(p, c.data[c.pos:c.pos+n])
+  	c.pos += n
+  	return n, nil
+  }
+  ```
+
+Feed the engine with `chunk=32` to exercise the tokenizer.
+
+---
+
+## Security Notes
+
+* Treat attributes as untrusted input. If you write files, **sanitize paths** and fence them under a base directory (see `secureJoin` in the Quick Start).
+* Apply allow-lists in handlers (`path` prefixes, URL hosts, command names) as needed by your environment.
+
+---
+
+## FAQ
+
+**Why not JSON?**
+Because code and prose contain braces and commas. JSON is brittle under truncation and edits. Tags degrade more gracefully and are easier to repair mentally.
+
+**Can I nest sections?**
+No. That is a deliberate constraint. Inside a recognized section, everything is text until the matching close. If you need true nesting, build a different layer on top.
+
+**What happens if the model never closes a tag?**
+The section emits at EOF with whatever content arrived. Fix the prompt to include the closer.
+
+**Do attribute keys keep their case?**
+They’re lowercased in the event. Values are returned without quotes (and with braces preserved for `{…}`).
+
+**Can a closer include spaces?**
+Yes: `</   create-file   >` is accepted.
+
+---
+
+## Design Notes
+
+* **Flat, one-section state.** This keeps the rules simple and the behavior predictable. Code inside sections won’t collide with the parser.
+* **Alias mapping.** The model can vary tag names; your handlers see only canonical names.
+* **Tokenizer tolerance.** Whitespace, quoted strings, and JSX braces are handled in a way that follows the stream without guessing.
+
+Short code. Clear rules. Immediate effects.
+
