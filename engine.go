@@ -61,9 +61,40 @@ func (s *HandlerSink) Emit(ev SectionEvent) {
 }
 
 // Engine coordinates streaming parsing and event emission.
-type Engine struct{ reg *Registry }
+type Engine struct {
+	reg        *Registry
+	options    EngineOptions
+	validators *ValidatorRegistry
+}
 
-func NewEngine(reg *Registry) *Engine { return &Engine{reg: reg} }
+// NewEngine creates a new Engine with the given registry and default options.
+func NewEngine(reg *Registry) *Engine {
+	return NewEngineWithOptions(reg, DefaultEngineOptions())
+}
+
+// NewEngineWithOptions creates a new Engine with the given registry and options.
+func NewEngineWithOptions(reg *Registry, options EngineOptions) *Engine {
+	return &Engine{
+		reg:        reg,
+		options:    options,
+		validators: NewValidatorRegistry(),
+	}
+}
+
+// RegisterValidator registers a validator for a section type.
+func (e *Engine) RegisterValidator(sectionName string, validator Validator) {
+	e.validators.Register(sectionName, validator)
+}
+
+// RegisterRegexValidator creates and registers a regex validator.
+func (e *Engine) RegisterRegexValidator(sectionName, pattern, description string) error {
+	return e.validators.RegisterRegex(sectionName, pattern, description)
+}
+
+// RegisterFuncValidator creates and registers a function validator.
+func (e *Engine) RegisterFuncValidator(sectionName string, validateFunc func(string, string, Position) error) {
+	e.validators.RegisterFunc(sectionName, validateFunc)
+}
 
 // ProcessStream incrementally parses from r and emits SectionEvents to sink as soon as sections close.
 // The format is a resilient XML-lite with rules:
@@ -77,13 +108,31 @@ func (e *Engine) ProcessStream(r io.Reader, sink *HandlerSink) error {
 	}
 	br := bufio.NewReader(r)
 
-	p := newParser(e.reg, sink)
+	p := newParser(e.reg, sink, e.options)
+	p.validators = e.validators // Pass validators to the parser
+
 	buf := make([]byte, 4096)
 	for {
 		n, readErr := br.Read(buf)
 		if n > 0 {
 			p.feed(buf[:n])
 			if err := p.drain(); err != nil {
+				// If a custom error handler is provided, use it
+				if p.errorHandler != nil {
+					if p.errorHandler(err) {
+						// Handler returned true, continue parsing
+						continue
+					}
+					// Handler returned false, stop parsing
+					return err
+				}
+
+				// No custom handler, use recovery mode
+				if e.options.RecoveryMode == ContinueMode {
+					// In a real implementation, we might use a logger here
+					// For now, we'll just continue
+					continue
+				}
 				return err
 			}
 		}
@@ -100,11 +149,68 @@ func (e *Engine) ProcessStream(r io.Reader, sink *HandlerSink) error {
 
 // --- Streaming parser implementation (flat / non-nested) ---
 
+// RecoveryMode defines how the parser should handle errors.
+type RecoveryMode int
+
+const (
+	// StrictMode stops parsing on the first error.
+	StrictMode RecoveryMode = iota
+
+	// ContinueMode attempts to recover from errors and continue parsing.
+	ContinueMode
+)
+
+// ErrorHandler is a function that can process parsing errors.
+// It receives the error and can decide whether to continue parsing.
+// If it returns true, parsing will continue; if false, parsing will stop.
+type ErrorHandler func(error) bool
+
+// EngineOptions configures the behavior of the Engine.
+type EngineOptions struct {
+	// RecoveryMode determines how the parser handles errors.
+	// Default is StrictMode.
+	RecoveryMode RecoveryMode
+
+	// ErrorHandler is called when a parsing error occurs.
+	// If nil, the default behavior is used based on RecoveryMode.
+	// If provided, it can override the RecoveryMode behavior.
+	ErrorHandler ErrorHandler
+}
+
+// DefaultEngineOptions returns the default engine options.
+func DefaultEngineOptions() EngineOptions {
+	return EngineOptions{
+		RecoveryMode: StrictMode,
+		ErrorHandler: nil, // Default to nil, will use RecoveryMode behavior
+	}
+}
+
+// WithContinueMode returns engine options configured for continue mode.
+func WithContinueMode() EngineOptions {
+	return EngineOptions{
+		RecoveryMode: ContinueMode,
+		ErrorHandler: nil,
+	}
+}
+
+// WithErrorHandler returns engine options with a custom error handler.
+func WithErrorHandler(handler ErrorHandler) EngineOptions {
+	return EngineOptions{
+		RecoveryMode: StrictMode, // Default to strict, but handler can override
+		ErrorHandler: handler,
+	}
+}
+
 type parser struct {
-	reg    *Registry
-	sink   *HandlerSink
-	buf    bytes.Buffer // rolling buffer of unconsumed bytes
-	active *element     // currently open recognized section, or nil
+	reg          *Registry
+	sink         *HandlerSink
+	buf          bytes.Buffer       // rolling buffer of unconsumed bytes
+	active       *element           // currently open recognized section, or nil
+	pos          Position           // current position in the input stream
+	recoveryMode RecoveryMode       // how to handle errors
+	errorHandler ErrorHandler       // custom error handler
+	validators   *ValidatorRegistry // content validators
+	lastContent  string             // recent content for error context
 }
 
 type element struct {
@@ -114,7 +220,15 @@ type element struct {
 	body  strings.Builder
 }
 
-func newParser(reg *Registry, sink *HandlerSink) *parser { return &parser{reg: reg, sink: sink} }
+func newParser(reg *Registry, sink *HandlerSink, options EngineOptions) *parser {
+	return &parser{
+		reg:          reg,
+		sink:         sink,
+		pos:          Position{Line: 1, Column: 1}, // Start at line 1, column 1
+		recoveryMode: options.RecoveryMode,
+		errorHandler: options.ErrorHandler,
+	}
+}
 
 func (p *parser) feed(b []byte) { p.buf.Write(b) }
 
@@ -146,18 +260,57 @@ func (p *parser) drain() error {
 
 			// Now data[0] == '<' — it *might* be our closing tag.
 			// Only close if it’s exactly a recognized close for this active section (by alias/canonical).
-			consumed, isClose, complete := p.parseOwnClose(data)
+			consumed, isClose, complete, err := p.parseOwnClose(data)
+			if err != nil {
+				// Error parsing closing tag
+				if p.recoveryMode == ContinueMode {
+					// In recovery mode, consume the bytes up to the error and continue
+					p.consume(consumed)
+					continue
+				}
+				return err
+			}
 			if !complete {
 				// Need more bytes to decide
 				return nil
 			}
 			if isClose {
-				// Consume the closing tag and emit the section event
+				// Consume the closing tag
 				p.consume(consumed)
+
+				// Prepare the section event
+				content := p.active.body.String()
+				sectionName := p.active.canon
+
+				// Validate the section content if validators are available
+				if p.validators != nil {
+					if err := p.validators.ValidateSection(sectionName, content, p.pos); err != nil {
+						// Handle validation error
+						if p.errorHandler != nil {
+							if p.errorHandler(err) {
+								// Handler returned true, continue with next section
+								p.active = nil
+								continue
+							}
+							// Handler returned false, stop parsing
+							return err
+						}
+
+						// No custom handler, use recovery mode
+						if p.recoveryMode == StrictMode {
+							return err
+						}
+						// In ContinueMode, just skip this section and continue
+						p.active = nil
+						continue
+					}
+				}
+
+				// Content is valid or no validators, emit the event
 				ev := SectionEvent{
-					Name:    p.active.canon,
+					Name:    sectionName,
 					Attrs:   p.active.attrs,
-					Content: p.active.body.String(),
+					Content: content,
 				}
 				p.active = nil
 				p.sink.Emit(ev)
@@ -190,7 +343,16 @@ func (p *parser) drain() error {
 		}
 
 		// data[0] == '<' — try to parse a tag token
-		consumed, tok, ok := parseTagToken(data)
+		consumed, tok, ok, err := parseTagToken(data, p.pos, p.lastContent)
+		if err != nil {
+			// Error parsing tag
+			if p.recoveryMode == ContinueMode {
+				// In recovery mode, consume the bytes up to the error and continue
+				p.consume(consumed)
+				continue
+			}
+			return err
+		}
 		if !ok {
 			// Need more bytes to complete tag
 			return nil
@@ -214,28 +376,32 @@ func (p *parser) drain() error {
 
 		case tokenClose:
 			// Closing tag with no active section → ignore
+			// In strict mode, we could report this as an error
+			if p.recoveryMode == StrictMode {
+				return NewUnmatchedTagError(p.pos, tok.name, p.lastContent)
+			}
 		}
 	}
 }
 
 // parseOwnClose checks whether data starts with a closing tag that should close p.active.
 // Accepts any alias whose canonical equals p.active.canon.
-// Returns (consumedBytes, isOurClose, complete).
+// Returns (consumedBytes, isOurClose, complete, error).
 
-func (p *parser) parseOwnClose(data []byte) (int, bool, bool) {
+func (p *parser) parseOwnClose(data []byte) (int, bool, bool, error) {
 	if p.active == nil {
-		return 0, false, true
+		return 0, false, true, nil
 	}
 	if len(data) < 2 || data[0] != '<' || data[1] != '/' {
-		return 0, false, true
+		return 0, false, true, nil
 	}
 	i := 2
-	// NEW: tolerate whitespace after "</"
+	// Tolerate whitespace after "</"
 	for i < len(data) && isSpace(data[i]) {
 		i++
 	}
 	if i == len(data) {
-		return 0, false, false
+		return 0, false, false, nil
 	}
 
 	start := i
@@ -243,10 +409,14 @@ func (p *parser) parseOwnClose(data []byte) (int, bool, bool) {
 		i++
 	}
 	if i == start { // no name
-		return 0, false, true
+		if p.recoveryMode == StrictMode {
+			return i, false, true, NewMalformedTagError(
+				p.pos, "", "missing tag name after '</'", p.lastContent)
+		}
+		return 0, false, true, nil
 	}
 	if i == len(data) { // incomplete closer across chunk
-		return 0, false, false
+		return 0, false, false, nil
 	}
 
 	closeName := strings.ToLower(string(data[start:i]))
@@ -254,12 +424,14 @@ func (p *parser) parseOwnClose(data []byte) (int, bool, bool) {
 	// Accept if canonical(closeName) == active.canon
 	if c, ok := p.reg.Canonical(closeName); ok {
 		if c != p.active.canon {
-			return 0, false, true
+			// Not our closing tag, but a valid tag name
+			return 0, false, true, nil
 		}
 	} else {
 		// Fallback: literal match against the original open tag name (case-insensitive)
 		if !strings.EqualFold(closeName, p.active.name) {
-			return 0, false, true
+			// Not our closing tag
+			return 0, false, true, nil
 		}
 	}
 
@@ -268,13 +440,17 @@ func (p *parser) parseOwnClose(data []byte) (int, bool, bool) {
 		i++
 	}
 	if i == len(data) {
-		return 0, false, false
+		return 0, false, false, nil
 	}
 	if data[i] != '>' {
-		return 0, false, true
+		if p.recoveryMode == StrictMode {
+			return i, false, true, NewMalformedTagError(
+				p.pos, closeName, "expected '>' after closing tag name", p.lastContent)
+		}
+		return 0, false, true, nil
 	}
 
-	return i + 1, true, true
+	return i + 1, true, true, nil
 }
 
 func (p *parser) finish() error {
@@ -285,12 +461,34 @@ func (p *parser) finish() error {
 	} else {
 		p.buf.Reset()
 	}
+
 	// Auto-close active recognized section on EOF
 	if p.active != nil && p.active.canon != "" {
+		content := p.active.body.String()
+		sectionName := p.active.canon
+
+		// Validate the section content if validators are available
+		if p.validators != nil {
+			if err := p.validators.ValidateSection(sectionName, content, p.pos); err != nil {
+				// Handle validation error
+				if p.errorHandler != nil {
+					if !p.errorHandler(err) {
+						// Handler returned false, stop parsing
+						return err
+					}
+					// Handler returned true, continue and emit anyway
+				} else if p.recoveryMode == StrictMode {
+					return err
+				}
+				// In ContinueMode or if handler returned true, emit anyway
+			}
+		}
+
+		// Emit the section event
 		p.sink.Emit(SectionEvent{
-			Name:    p.active.canon,
+			Name:    sectionName,
 			Attrs:   p.active.attrs,
-			Content: p.active.body.String(),
+			Content: content,
 		})
 		p.active = nil
 	}
@@ -305,7 +503,34 @@ func (p *parser) appendText(s string) {
 	p.active.body.WriteString(s)
 }
 
-func (p *parser) consume(n int) { _ = p.buf.Next(n) }
+// consume processes n bytes from the buffer, updating position tracking
+func (p *parser) consume(n int) {
+	// Store the consumed bytes for context in error messages
+	consumed := p.buf.Bytes()[:n]
+	p.updateLastContent(string(consumed))
+
+	// Update line and column positions
+	for i := 0; i < n; i++ {
+		if i < len(consumed) && consumed[i] == '\n' {
+			p.pos.Line++
+			p.pos.Column = 1
+		} else {
+			p.pos.Column++
+		}
+	}
+
+	// Remove the bytes from the buffer
+	_ = p.buf.Next(n)
+}
+
+// updateLastContent maintains a sliding window of recent content for error context
+func (p *parser) updateLastContent(s string) {
+	const maxContextLen = 1000 // Limit context size to avoid memory issues
+	p.lastContent += s
+	if len(p.lastContent) > maxContextLen {
+		p.lastContent = p.lastContent[len(p.lastContent)-maxContextLen:]
+	}
+}
 
 // --- Tag tokenization ---
 
@@ -324,10 +549,11 @@ type tagToken struct {
 }
 
 // parseTagToken tries to parse a single tag token from the beginning of data (which must start with '<').
-// Returns (consumedBytes, token, ok). If ok=false, the caller should wait for more input.
-func parseTagToken(data []byte) (int, tagToken, bool) {
+// Returns (consumedBytes, token, ok, error). If ok=false and error is nil, the caller should wait for more input.
+// If error is not nil, parsing failed with a specific error.
+func parseTagToken(data []byte, pos Position, context string) (int, tagToken, bool, error) {
 	if len(data) == 0 || data[0] != '<' {
-		return 0, tagToken{}, false
+		return 0, tagToken{}, false, nil
 	}
 
 	i := 1
@@ -345,14 +571,18 @@ func parseTagToken(data []byte) (int, tagToken, bool) {
 			i++
 		}
 		if i == len(data) {
-			return 0, tagToken{}, false
+			return 0, tagToken{}, false, nil
 		}
 		name := string(data[start:i])
 		skipSpaces()
-		if i == len(data) || data[i] != '>' {
-			return 0, tagToken{}, false
+		if i == len(data) {
+			return 0, tagToken{}, false, nil
 		}
-		return i + 1, tagToken{kind: tokenClose, name: name}, true
+		if data[i] != '>' {
+			return i, tagToken{}, false, NewMalformedTagError(
+				pos, name, "expected '>' after closing tag name", context)
+		}
+		return i + 1, tagToken{kind: tokenClose, name: name}, true, nil
 	}
 
 	// Opening or self-closing
@@ -361,7 +591,11 @@ func parseTagToken(data []byte) (int, tagToken, bool) {
 		i++
 	}
 	if i == len(data) {
-		return 0, tagToken{}, false
+		return 0, tagToken{}, false, nil
+	}
+	if start == i {
+		return i, tagToken{}, false, NewMalformedTagError(
+			pos, "", "missing tag name after '<'", context)
 	}
 	name := string(data[start:i])
 
@@ -369,18 +603,22 @@ func parseTagToken(data []byte) (int, tagToken, bool) {
 	for {
 		skipSpaces()
 		if i == len(data) {
-			return 0, tagToken{}, false
+			return 0, tagToken{}, false, nil
 		}
 
 		switch data[i] {
 		case '>':
-			return i + 1, tagToken{kind: tokenOpen, name: name, attrs: attrs}, true
+			return i + 1, tagToken{kind: tokenOpen, name: name, attrs: attrs}, true, nil
 		case '/':
 			i++
-			if i == len(data) || data[i] != '>' {
-				return 0, tagToken{}, false
+			if i == len(data) {
+				return 0, tagToken{}, false, nil
 			}
-			return i + 1, tagToken{kind: tokenSelfClose, name: name, attrs: attrs}, true
+			if data[i] != '>' {
+				return i, tagToken{}, false, NewMalformedTagError(
+					pos, name, "expected '>' after '/' in self-closing tag", context)
+			}
+			return i + 1, tagToken{kind: tokenSelfClose, name: name, attrs: attrs}, true, nil
 		}
 
 		// attribute key
@@ -389,18 +627,26 @@ func parseTagToken(data []byte) (int, tagToken, bool) {
 			i++
 		}
 		if i == len(data) {
-			return 0, tagToken{}, false
+			return 0, tagToken{}, false, nil
+		}
+		if kStart == i {
+			return i, tagToken{}, false, NewMalformedTagError(
+				pos, name, "expected attribute name or '>' or '/>'", context)
 		}
 		key := string(data[kStart:i])
 
 		skipSpaces()
-		if i == len(data) || data[i] != '=' {
-			return 0, tagToken{}, false
+		if i == len(data) {
+			return 0, tagToken{}, false, nil
+		}
+		if data[i] != '=' {
+			return i, tagToken{}, false, NewAttributeParsingError(
+				pos, name, key, "expected '=' after attribute name", context)
 		}
 		i++
 		skipSpaces()
 		if i == len(data) {
-			return 0, tagToken{}, false
+			return 0, tagToken{}, false, nil
 		}
 
 		// attribute value: quoted "…"/'…' OR JSX braced { … }
@@ -417,7 +663,7 @@ func parseTagToken(data []byte) (int, tagToken, bool) {
 				i++
 			}
 			if i == len(data) {
-				return 0, tagToken{}, false
+				return 0, tagToken{}, false, nil
 			}
 			val := string(data[vStart:i])
 			i++ // consume closing quote
@@ -447,7 +693,7 @@ func parseTagToken(data []byte) (int, tagToken, bool) {
 						i++
 					}
 					if i == len(data) {
-						return 0, tagToken{}, false
+						return 0, tagToken{}, false, nil
 					}
 					i++ // consume closing quote
 				default:
@@ -455,14 +701,14 @@ func parseTagToken(data []byte) (int, tagToken, bool) {
 				}
 			}
 			if depth != 0 {
-				return 0, tagToken{}, false
+				return 0, tagToken{}, false, nil
 			} // incomplete
 			val := string(data[vStart : i-1]) // without outer braces
 			attrs[strings.ToLower(strings.TrimSpace(key))] = "{" + val + "}"
 
 		default:
-			// unsupported value form (bareword) → treat as incomplete to wait for more bytes
-			return 0, tagToken{}, false
+			return i, tagToken{}, false, NewAttributeParsingError(
+				pos, name, key, "expected attribute value to start with quote or brace", context)
 		}
 	}
 }
