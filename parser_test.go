@@ -87,7 +87,8 @@ func Test_Engine_Should_Ignore_Unmatched_Closing_Tag_Gracefully(t *testing.T) {
 	reg.Register(SectionPlugin{Name: "think"})
 	sink, got := newSinkCatcher("think")
 
-	en := NewEngine(reg)
+	// Use continue mode to ignore unmatched closing tags
+	en := NewEngineWithOptions(reg, WithContinueMode())
 	input := `</bogus><think>hi</think></bogus>`
 	if err := en.ProcessStream(ReaderFromString(input), sink); err != nil {
 		t.Fatalf("ProcessStream error: %v", err)
